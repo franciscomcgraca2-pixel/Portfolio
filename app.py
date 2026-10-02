@@ -49,8 +49,10 @@ def ideias_publicas() -> bool:
 def pode_editar() -> bool:
     """Só quem entrou com a palavra-passe (ou uso local, sem palavra-passe) pode alterar a carteira."""
     try:
-        st.secrets["APP_PASSWORD"]
+        tem_senha = "APP_PASSWORD" in st.secrets
     except Exception:
+        return True  # sem Secrets (uso local)
+    if not tem_senha:
         return True
     return bool(st.session_state.get("autenticado"))
 
