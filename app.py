@@ -2,6 +2,7 @@ import base64
 import concurrent.futures as cf
 import hmac
 import io
+import json
 from datetime import date, datetime
 from math import sqrt
 
@@ -23,12 +24,26 @@ st.markdown(
 )
 
 
+def agora_pt() -> pd.Timestamp:
+    """Hora atual em Lisboa (o servidor da nuvem está em UTC)."""
+    return pd.Timestamp.now(tz="Europe/Lisbon")
+
+
+def _opcao(nome: str, padrao: bool = True) -> bool:
+    try:
+        return bool(st.secrets.get(nome, padrao))
+    except Exception:
+        return padrao
+
+
 def visualizacao_permitida() -> bool:
     """O botão «Visualização» pode ser desligado com VISUALIZACAO_PUBLICA = false nos Secrets."""
-    try:
-        return bool(st.secrets.get("VISUALIZACAO_PUBLICA", True))
-    except Exception:
-        return True
+    return _opcao("VISUALIZACAO_PUBLICA")
+
+
+def ideias_publicas() -> bool:
+    """O botão «Ideias de ações» pode ser desligado com IDEIAS_PUBLICAS = false nos Secrets."""
+    return _opcao("IDEIAS_PUBLICAS")
 
 
 def pode_editar() -> bool:
@@ -41,7 +56,7 @@ def pode_editar() -> bool:
 
 
 def obter_modo() -> str:
-    """Devolve 'edicao' (palavra-passe certa, ou uso local) ou 'visualizacao' (só leitura da carteira guardada)."""
+    """Devolve 'edicao' (palavra-passe certa, ou uso local), 'visualizacao' (só leitura da carteira) ou 'publico' (só as ideias de ações)."""
     try:
         senha = st.secrets["APP_PASSWORD"]
     except Exception:
@@ -51,7 +66,11 @@ def obter_modo() -> str:
         return "edicao"  # uso local, sem palavra-passe
     if st.session_state.get("autenticado"):
         return "edicao"
-    pode_ver = config_github() is not None and visualizacao_permitida()
+    tem_nuvem = config_github() is not None
+    pode_ver = tem_nuvem and visualizacao_permitida()
+    pode_ideias = tem_nuvem and ideias_publicas()
+    if pode_ideias and st.session_state.get("ideias_publico"):
+        return "publico"
     if pode_ver and st.session_state.get("visualizacao"):
         return "visualizacao"
 
@@ -61,11 +80,14 @@ def obter_modo() -> str:
         st.rerun()
     elif tentativa:
         st.error("Palavra-passe errada.")
-    if pode_ver:
+    if pode_ver or pode_ideias:
         st.caption("ou")
-        if st.button("👁️ Visualização"):
-            st.session_state["visualizacao"] = True
-            st.rerun()
+    if pode_ver and st.button("👁️ Visualização"):
+        st.session_state["visualizacao"] = True
+        st.rerun()
+    if pode_ideias and st.button("💡 Ideias de ações"):
+        st.session_state["ideias_publico"] = True
+        st.rerun()
     st.stop()
 
 
@@ -182,7 +204,7 @@ def _taxa_para_eur(moeda: str):
 def obter_precos(tickers: tuple):
     with cf.ThreadPoolExecutor(max_workers=8) as ex:
         precos = dict(zip(tickers, ex.map(_preco, tickers)))
-    return precos, datetime.now().strftime("%H:%M")
+    return precos, agora_pt().strftime("%H:%M")
 
 
 @st.cache_data(ttl=CACHE_SEGUNDOS, show_spinner=False)
@@ -228,7 +250,7 @@ def obter_noticias(tickers: tuple):
     """Notícias e hora a que foram obtidas. Mesmo prazo de validade das cotações."""
     with cf.ThreadPoolExecutor(max_workers=8) as ex:
         noticias = dict(zip(tickers, ex.map(_noticias, tickers)))
-    return noticias, datetime.now().strftime("%H:%M")
+    return noticias, agora_pt().strftime("%H:%M")
 
 
 # ---------------------------- Dividendos ----------------------------
@@ -564,7 +586,7 @@ def _ler_remoto(repo: str, caminho: str, ramo: str, _token: str):
     return texto, dados["sha"], None
 
 
-def guardar_remoto(cfg: dict, texto: str, sha, mensagem: str):
+def guardar_remoto(cfg: dict, texto: str, sha, mensagem: str, caminho=None):
     """Grava o CSV no repositório. Devolve None se correu bem, ou a mensagem de erro."""
     corpo = {
         "message": mensagem,
@@ -575,7 +597,7 @@ def guardar_remoto(cfg: dict, texto: str, sha, mensagem: str):
         corpo["sha"] = sha
     try:
         r = requests.put(
-            f"https://api.github.com/repos/{cfg['repo']}/contents/{cfg['ficheiro']}",
+            f"https://api.github.com/repos/{cfg['repo']}/contents/{caminho or cfg['ficheiro']}",
             headers=_cabecalhos(cfg["token"]), json=corpo, timeout=20,
         )
     except Exception as e:
@@ -740,6 +762,189 @@ def painel_gerir(dados: pd.DataFrame, cfg, sha):
             _guardar_e_atualizar(cfg, importado, sha, "Carteira importada de CSV", "Carteira importada ✅")
 
 
+# ---------------------------- Ideias de ações (IA) ----------------------------
+FICHEIRO_IDEIAS = "ideias.json"
+MODELO_PADRAO = "claude-sonnet-5-5"
+UNIVERSO_PADRAO = (
+    "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "BRK-B", "JPM", "V",
+    "LLY", "JNJ", "UNH", "XOM", "CVX", "PG", "KO", "COST", "WMT", "HD",
+    "NFLX", "AMD", "CRM", "ASML", "NVO", "EDP.LS", "GALP.LS", "SAN.MC",
+    "VWCE.DE", "IWDA.AS", "SXR8.DE",
+)
+AVISO_IDEIAS = (
+    "Conteúdo gerado por inteligência artificial a partir de dados públicos do Yahoo Finance. Não é aconselhamento "
+    "financeiro nem recomendação personalizada: não conhece a tua situação, os teus objetivos nem a tua tolerância ao "
+    "risco, e pode conter erros. Investir envolve risco de perda do capital. Confirma sempre os dados antes de decidir."
+)
+SISTEMA_IDEIAS = """És um analista de mercados financeiros sénior, rigoroso e prudente. Escreves em português de Portugal.
+Recebes uma tabela com dados atuais de mercado (Yahoo Finance) de um universo de ações e ETF. A tua tarefa é escolher 5 ideias que mereçam ser estudadas por um investidor particular, diversificadas por setor e região.
+
+Regras:
+- Usa apenas os números da tabela. Não inventes dados, preços, datas nem notícias. Se faltar um dado, diz que não está disponível.
+- Para cada ideia usa exatamente este formato em Markdown:
+### N. Nome (TICKER) · tipo · setor
+**Tese:** 2 a 3 frases.
+**O que os dados mostram:** refere números da tabela (retornos, volatilidade, avaliação, distância ao máximo, alvo dos analistas).
+**Riscos:** 2 ou 3 riscos concretos.
+**Quando rever a ideia:** o que invalidaria a tese.
+**Perfil e horizonte:** para que tipo de investidor e prazo faz sentido.
+- Inclui pelo menos um ETF diversificado se existir no universo.
+- Não prometas retornos, não uses linguagem de certeza nem de urgência (como «compra já») e não inventes preços-alvo.
+- Termina com uma secção «Notas» com 2 ou 3 frases sobre os limites desta análise. Não escrevas mais nada fora deste formato."""
+
+
+def _segredo(nome: str):
+    try:
+        return st.secrets[nome]
+    except Exception:
+        return None
+
+
+def universo_ideias() -> tuple:
+    """Ativos analisados. Pode ser mudado com UNIVERSO_ACOES = "AAPL, MSFT, EDP.LS" nos Secrets."""
+    texto = str(_segredo("UNIVERSO_ACOES") or "")
+    lista = [t.strip().upper() for t in texto.split(",") if t.strip()]
+    return tuple(lista) if lista else UNIVERSO_PADRAO
+
+
+def _arredondar(valor, casas: int = 1):
+    return round(float(valor), casas) if isinstance(valor, (int, float)) else ""
+
+
+def _dados_mercado(ticker: str):
+    """Linha de dados de mercado de um ativo, ou None se não houver histórico suficiente."""
+    try:
+        t = yf.Ticker(ticker)
+        h = t.history(period="1y")["Close"].dropna()
+        if len(h) < 70:
+            return None
+        try:
+            info = t.info or {}
+        except Exception:
+            info = {}
+        noticia = _noticias(ticker, 1)
+        preco = float(h.iloc[-1])
+        return {
+            "Ticker": ticker,
+            "Nome": info.get("shortName") or info.get("longName") or ticker,
+            "Tipo": info.get("quoteType") or "",
+            "Setor": info.get("sector") or info.get("category") or "",
+            "Moeda": info.get("currency") or "",
+            "Preço": round(preco, 2),
+            "Ret 1M %": round((preco / float(h.iloc[-22]) - 1) * 100, 1),
+            "Ret 3M %": round((preco / float(h.iloc[-64]) - 1) * 100, 1),
+            "Ret 12M %": round((preco / float(h.iloc[0]) - 1) * 100, 1),
+            "Volatilidade anual %": round(float(h.pct_change().std()) * sqrt(DIAS_UTEIS_ANO) * 100, 1),
+            "Distância ao máximo 12M %": round((preco / float(h.max()) - 1) * 100, 1),
+            "P/E": _arredondar(info.get("trailingPE")),
+            "P/E futuro": _arredondar(info.get("forwardPE")),
+            "Alvo médio analistas": _arredondar(info.get("targetMeanPrice"), 2),
+            "Recomendação analistas": info.get("recommendationKey") or "",
+            "Capitalização (mil M)": _arredondar((info.get("marketCap") or 0) / 1e9) if info.get("marketCap") else "",
+            "Notícia recente": noticia[0]["titulo"] if noticia else "",
+        }
+    except Exception:
+        return None
+
+
+def recolher_mercado(universo: tuple) -> pd.DataFrame:
+    with cf.ThreadPoolExecutor(max_workers=8) as ex:
+        linhas = [l for l in ex.map(_dados_mercado, universo) if l]
+    return pd.DataFrame(linhas)
+
+
+def gerar_ideias(chave: str, modelo: str, universo: tuple) -> dict:
+    """Recolhe dados atuais e pede ao Claude 5 ideias fundamentadas. Demora cerca de 1 minuto."""
+    import anthropic  # só é preciso quando se geram ideias
+
+    tabela = recolher_mercado(universo)
+    if tabela.empty:
+        raise RuntimeError("Não consegui obter dados de mercado do Yahoo Finance.")
+    agora = agora_pt()
+    pedido = (
+        f"Data de hoje: {agora:%d/%m/%Y}.\n\n"
+        "Dados de mercado (CSV; retornos e distâncias em %, preços na moeda indicada):\n"
+        f"{tabela.to_csv(index=False)}\n"
+        "Escolhe as 5 ideias."
+    )
+    cliente = anthropic.Anthropic(api_key=chave)
+    resposta = cliente.messages.create(
+        model=modelo, max_tokens=3000, system=SISTEMA_IDEIAS,
+        messages=[{"role": "user", "content": pedido}],
+    )
+    texto = "".join(b.text for b in resposta.content if getattr(b, "type", "") == "text").strip()
+    if not texto:
+        raise RuntimeError("A IA devolveu uma resposta vazia.")
+    return {
+        "gerado": f"{agora:%d/%m/%Y %H:%M}", "gerado_iso": agora.isoformat(),
+        "modelo": modelo, "universo": len(tabela), "texto": texto,
+    }
+
+
+def painel_ideias(cfg, editar: bool):
+    """Mostra as ideias guardadas (qualquer pessoa vê). Só quem tem palavra-passe pode gerar novas."""
+    st.subheader("💡 Ideias de ações")
+    st.warning(AVISO_IDEIAS)
+
+    guardadas, sha_ideias = None, None
+    if cfg:
+        texto, sha_ideias, erro = _ler_remoto(cfg["repo"], FICHEIRO_IDEIAS, cfg["ramo"], cfg["token"])
+        if erro:
+            st.error(erro)
+        elif texto:
+            try:
+                guardadas = json.loads(texto)
+            except Exception:
+                st.error("O ficheiro das ideias está danificado. Gera novas ideias.")
+    else:
+        guardadas = st.session_state.get("ideias_local")
+
+    if guardadas:
+        st.caption(
+            f"Geradas em {guardadas.get('gerado', '?')} · {guardadas.get('universo', '?')} ativos analisados "
+            f"· modelo {guardadas.get('modelo', '?')}"
+        )
+        try:
+            idade = (agora_pt() - pd.Timestamp(guardadas["gerado_iso"])).days
+            if idade >= 7:
+                st.warning(f"Estas ideias têm {idade} dias e os mercados mudam depressa. Não as uses sem verificar os dados atuais.")
+        except Exception:
+            pass
+        st.markdown(guardadas.get("texto", ""))
+    else:
+        st.info("Ainda não há ideias geradas.")
+
+    if editar:
+        st.divider()
+        chave = _segredo("ANTHROPIC_API_KEY")
+        if not chave:
+            st.info("Para gerar ideias, acrescenta ANTHROPIC_API_KEY (a tua chave da Anthropic) nos Secrets da app.")
+        elif st.button("🔄 Gerar novas ideias"):
+            if not pode_editar():
+                st.error("Sem permissão. Entra com a palavra-passe.")
+                return
+            novo = None
+            with st.spinner("A analisar o mercado e a escrever as ideias (cerca de 1 minuto)..."):
+                try:
+                    novo = gerar_ideias(str(chave), str(_segredo("ANTHROPIC_MODELO") or MODELO_PADRAO), universo_ideias())
+                except Exception as e:
+                    st.error(f"Não consegui gerar as ideias: {e}")
+            if novo:
+                if cfg:
+                    erro = guardar_remoto(
+                        cfg, json.dumps(novo, ensure_ascii=False, indent=2), sha_ideias,
+                        "Ideias de ações geradas", caminho=FICHEIRO_IDEIAS,
+                    )
+                    if erro:
+                        st.error(erro)
+                        return
+                    _ler_remoto.clear()
+                else:
+                    st.session_state["ideias_local"] = novo
+                st.session_state["msg_toast"] = "Ideias novas geradas ✅"
+                st.rerun()
+
+
 # ---------------------------- Interface ----------------------------
 st.title("📈 Análise do meu Portefólio")
 modo = obter_modo()
@@ -748,6 +953,13 @@ if "msg_toast" in st.session_state:
     st.toast(st.session_state.pop("msg_toast"))
 
 cfg = config_github()  # None se a carteira não estiver ligada ao GitHub
+
+if modo == "publico":  # acesso público: só as ideias de ações; a carteira fica protegida
+    if st.button("🔒 Entrar com palavra-passe"):
+        st.session_state["ideias_publico"] = False
+        st.rerun()
+    painel_ideias(cfg, editar=False)
+    st.stop()
 
 if not editar:
     st.info("👁️ Modo de visualização: só leitura. Para registar compras e vendas, entra com a palavra-passe.")
@@ -865,12 +1077,13 @@ if sem_cotacao:
     )
 
 # ---------------------------- Separadores ----------------------------
-nomes_abas = ["Dashboard Geral", "Alocação por Setor/País", "Métricas de Risco", "Dividendos", "Notícias do Mercado"]
+nomes_abas = ["Dashboard Geral", "Alocação por Setor/País", "Métricas de Risco", "Dividendos",
+              "Notícias do Mercado", "Ideias de ações"]
 if editar:
     nomes_abas.append("Gerir carteira")
 abas = st.tabs(nomes_abas)
-tab_dash, tab_aloc, tab_risco, tab_div, tab_news = abas[:5]
-tab_gerir = abas[5] if editar else None
+tab_dash, tab_aloc, tab_risco, tab_div, tab_news, tab_ideias = abas[:6]
+tab_gerir = abas[6] if editar else None
 
 # ======== Dashboard Geral ========
 with tab_dash:
@@ -1159,6 +1372,10 @@ with tab_news:
                 titulo = n["titulo"].replace("[", "(").replace("]", ")")
                 data_txt = "" if pd.isna(n["data"]) else f" · {n['data']:%d/%m/%Y %H:%M}"
                 st.markdown(f"**[{titulo}]({n['url']})**  \n{n['fonte']}{data_txt}")
+
+# ======== Ideias de ações ========
+with tab_ideias:
+    painel_ideias(cfg, editar)
 
 # ======== Gerir carteira (só em modo de edição) ========
 if editar:
