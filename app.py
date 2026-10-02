@@ -23,24 +23,51 @@ st.markdown(
 )
 
 
-def verificar_acesso():
-    """Se existir APP_PASSWORD nos 'Secrets' da app, pede a palavra-passe antes de mostrar o portefólio."""
+def visualizacao_permitida() -> bool:
+    """O botão «Visualização» pode ser desligado com VISUALIZACAO_PUBLICA = false nos Secrets."""
+    try:
+        return bool(st.secrets.get("VISUALIZACAO_PUBLICA", True))
+    except Exception:
+        return True
+
+
+def pode_editar() -> bool:
+    """Só quem entrou com a palavra-passe (ou uso local, sem palavra-passe) pode alterar a carteira."""
+    try:
+        st.secrets["APP_PASSWORD"]
+    except Exception:
+        return True
+    return bool(st.session_state.get("autenticado"))
+
+
+def obter_modo() -> str:
+    """Devolve 'edicao' (palavra-passe certa, ou uso local) ou 'visualizacao' (só leitura da carteira guardada)."""
     try:
         senha = st.secrets["APP_PASSWORD"]
     except Exception:
         if config_github() is not None:
             st.error("Por segurança, define APP_PASSWORD nos Secrets antes de ativar a gravação da carteira na nuvem.")
             st.stop()
-        return  # sem palavra-passe configurada (uso local)
+        return "edicao"  # uso local, sem palavra-passe
     if st.session_state.get("autenticado"):
-        return
+        return "edicao"
+    pode_ver = config_github() is not None and visualizacao_permitida()
+    if pode_ver and st.session_state.get("visualizacao"):
+        return "visualizacao"
+
     tentativa = st.text_input("🔒 Palavra-passe", type="password")
     if tentativa and hmac.compare_digest(tentativa.encode(), str(senha).encode()):
         st.session_state["autenticado"] = True
         st.rerun()
     elif tentativa:
         st.error("Palavra-passe errada.")
+    if pode_ver:
+        st.caption("ou")
+        if st.button("👁️ Visualização"):
+            st.session_state["visualizacao"] = True
+            st.rerun()
     st.stop()
+
 
 COLUNAS = ["Ticker", "Quantidade", "Preço Médio de Compra", "Tipo de Ativo", "Setor", "País"]
 TIPOS_VALIDOS = ["Ações", "ETF", "Crypto", "P2P"]
@@ -604,6 +631,9 @@ def registar_venda(df: pd.DataFrame, ticker: str, qtd: float, preco: float, data
 
 
 def _guardar_e_atualizar(cfg, df, sha, mensagem, toast) -> bool:
+    if not pode_editar():
+        st.error("Sem permissão para alterar a carteira. Entra com a palavra-passe.")
+        return False
     erro = guardar_remoto(cfg, para_csv(df), sha, mensagem)
     if erro:
         st.error(erro)
@@ -712,11 +742,18 @@ def painel_gerir(dados: pd.DataFrame, cfg, sha):
 
 # ---------------------------- Interface ----------------------------
 st.title("📈 Análise do meu Portefólio")
-verificar_acesso()
+modo = obter_modo()
+editar = modo == "edicao"
 if "msg_toast" in st.session_state:
     st.toast(st.session_state.pop("msg_toast"))
 
 cfg = config_github()  # None se a carteira não estiver ligada ao GitHub
+
+if not editar:
+    st.info("👁️ Modo de visualização: só leitura. Para registar compras e vendas, entra com a palavra-passe.")
+    if st.button("🔒 Entrar com palavra-passe"):
+        st.session_state["visualizacao"] = False
+        st.rerun()
 
 # Atualizar e carregar ficheiro ficam na página principal: no telemóvel não é preciso abrir o menu
 if st.button("🔄 Atualizar dados"):
@@ -735,6 +772,9 @@ if cfg:
         st.stop()
     if texto_remoto is not None:
         bruto, remoto_existe = ler_csv_texto(texto_remoto), True
+if bruto is None and not editar:
+    st.info("Ainda não há nenhuma carteira guardada para visualizar.")
+    st.stop()
 if bruto is None:
     if cfg:
         st.info("Ainda não tens uma carteira guardada. Carrega o teu CSV e guarda-o na nuvem.")
@@ -755,20 +795,22 @@ if bruto is None:
     st.stop()
 
 dados = validar(bruto)
-if cfg and not remoto_existe and not dados.empty:
+if editar and cfg and not remoto_existe and not dados.empty:
     st.warning("Esta carteira ainda não está guardada na nuvem.")
     if st.button("☁️ Guardar esta carteira na nuvem"):
         _guardar_e_atualizar(cfg, dados, None, "Carteira inicial", "Carteira guardada na nuvem ✅")
 if dados.empty:
     st.warning("A carteira está vazia.")
-    painel_gerir(dados, cfg, sha)
+    if editar:
+        painel_gerir(dados, cfg, sha)
     st.stop()
 
 # Posições atuais = linhas sem data de venda, juntas por ativo; todas as linhas (lotes) servem para o histórico
 abertas = dados[dados["Data Venda"].isna()]
 if abertas.empty:
     st.warning("Não há posições abertas (todas as linhas têm data de venda).")
-    painel_gerir(dados, cfg, sha)
+    if editar:
+        painel_gerir(dados, cfg, sha)
     st.stop()
 base = agregar_posicoes(abertas)
 lotes = dados[dados["Data Compra"].notna()]
@@ -823,9 +865,12 @@ if sem_cotacao:
     )
 
 # ---------------------------- Separadores ----------------------------
-tab_dash, tab_aloc, tab_risco, tab_div, tab_news, tab_gerir = st.tabs(
-    ["Dashboard Geral", "Alocação por Setor/País", "Métricas de Risco", "Dividendos", "Notícias do Mercado", "Gerir carteira"]
-)
+nomes_abas = ["Dashboard Geral", "Alocação por Setor/País", "Métricas de Risco", "Dividendos", "Notícias do Mercado"]
+if editar:
+    nomes_abas.append("Gerir carteira")
+abas = st.tabs(nomes_abas)
+tab_dash, tab_aloc, tab_risco, tab_div, tab_news = abas[:5]
+tab_gerir = abas[5] if editar else None
 
 # ======== Dashboard Geral ========
 with tab_dash:
@@ -1115,6 +1160,7 @@ with tab_news:
                 data_txt = "" if pd.isna(n["data"]) else f" · {n['data']:%d/%m/%Y %H:%M}"
                 st.markdown(f"**[{titulo}]({n['url']})**  \n{n['fonte']}{data_txt}")
 
-# ======== Gerir carteira ========
-with tab_gerir:
-    painel_gerir(dados, cfg, sha)
+# ======== Gerir carteira (só em modo de edição) ========
+if editar:
+    with tab_gerir:
+        painel_gerir(dados, cfg, sha)
