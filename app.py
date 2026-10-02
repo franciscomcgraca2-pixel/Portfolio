@@ -1,15 +1,46 @@
+import base64
 import concurrent.futures as cf
-from datetime import datetime
+import hmac
+import io
+from datetime import date, datetime
 from math import sqrt
 
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import requests
 import streamlit as st
 import yfinance as yf
 
 st.set_page_config(page_title="Análise de Portefólio", page_icon="📈", layout="wide")
+
+# Margens mais pequenas para aproveitar o ecrã do telemóvel
+st.markdown(
+    "<style>.block-container, [data-testid='stMainBlockContainer'] "
+    "{padding-top: 2rem; padding-left: 1rem; padding-right: 1rem;}</style>",
+    unsafe_allow_html=True,
+)
+
+
+def verificar_acesso():
+    """Se existir APP_PASSWORD nos 'Secrets' da app, pede a palavra-passe antes de mostrar o portefólio."""
+    try:
+        senha = st.secrets["APP_PASSWORD"]
+    except Exception:
+        if config_github() is not None:
+            st.error("Por segurança, define APP_PASSWORD nos Secrets antes de ativar a gravação da carteira na nuvem.")
+            st.stop()
+        return  # sem palavra-passe configurada (uso local)
+    if st.session_state.get("autenticado"):
+        return
+    tentativa = st.text_input("🔒 Palavra-passe", type="password")
+    if tentativa and hmac.compare_digest(tentativa.encode(), str(senha).encode()):
+        st.session_state["autenticado"] = True
+        st.rerun()
+    elif tentativa:
+        st.error("Palavra-passe errada.")
+    st.stop()
 
 COLUNAS = ["Ticker", "Quantidade", "Preço Médio de Compra", "Tipo de Ativo", "Setor", "País"]
 TIPOS_VALIDOS = ["Ações", "ETF", "Crypto", "P2P"]
@@ -453,37 +484,291 @@ def mostrar_alocacao(df: pd.DataFrame, coluna: str, coluna_valor: str, tipo: str
     st.dataframe(tabela, hide_index=True, width="stretch")
 
 
-# ---------------------------- Interface: barra lateral ----------------------------
+# ---------------------------- Carteira guardada no GitHub ----------------------------
+MOEDAS = ["EUR", "USD", "GBP", "CHF", "CAD", "SEK", "NOK", "DKK", "JPY", "BRL"]
+COLUNAS_FICHEIRO = COLUNAS + ["Moeda", "Data Compra", "Data Venda", "Preço Venda"]
+
+
+def config_github():
+    """Lê dos 'Secrets' onde a carteira fica guardada (um repositório privado do GitHub)."""
+    try:
+        token, repo = st.secrets["GITHUB_TOKEN"], st.secrets["GITHUB_REPO"]
+    except Exception:
+        return None
+    return {
+        "token": str(token),
+        "repo": str(repo),
+        "ficheiro": str(st.secrets.get("GITHUB_FICHEIRO", "carteira.csv")),
+        "ramo": str(st.secrets.get("GITHUB_RAMO", "main")),
+    }
+
+
+def _cabecalhos(token: str) -> dict:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+def _mensagem(r) -> str:
+    try:
+        return r.json().get("message", "")
+    except Exception:
+        return ""
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _ler_remoto(repo: str, caminho: str, ramo: str, _token: str):
+    """Devolve (texto do CSV, sha, erro). Se o ficheiro ainda não existe: (None, None, None)."""
+    base_url = f"https://api.github.com/repos/{repo}"
+    try:
+        r = requests.get(f"{base_url}/contents/{caminho}", headers=_cabecalhos(_token), params={"ref": ramo}, timeout=20)
+        if r.status_code == 404:
+            if requests.get(base_url, headers=_cabecalhos(_token), timeout=20).status_code == 200:
+                return None, None, None  # o repositório existe, falta só o ficheiro
+            return None, None, "Repositório não encontrado ou sem acesso. Confirma GITHUB_REPO e as permissões do token."
+    except Exception as e:
+        return None, None, f"Não consegui ligar ao GitHub: {e}"
+    if r.status_code != 200:
+        return None, None, f"GitHub devolveu {r.status_code}: {_mensagem(r)}"
+    dados = r.json()
+    texto = base64.b64decode(dados["content"]).decode("utf-8-sig")
+    return texto, dados["sha"], None
+
+
+def guardar_remoto(cfg: dict, texto: str, sha, mensagem: str):
+    """Grava o CSV no repositório. Devolve None se correu bem, ou a mensagem de erro."""
+    corpo = {
+        "message": mensagem,
+        "content": base64.b64encode(texto.encode("utf-8")).decode(),
+        "branch": cfg["ramo"],
+    }
+    if sha:
+        corpo["sha"] = sha
+    try:
+        r = requests.put(
+            f"https://api.github.com/repos/{cfg['repo']}/contents/{cfg['ficheiro']}",
+            headers=_cabecalhos(cfg["token"]), json=corpo, timeout=20,
+        )
+    except Exception as e:
+        return f"Não consegui ligar ao GitHub: {e}"
+    if r.status_code in (200, 201):
+        return None
+    if r.status_code in (409, 422):
+        return "A carteira mudou entretanto (noutro dispositivo?). Carrega em «Atualizar dados» e repete a operação."
+    return f"GitHub devolveu {r.status_code}: {_mensagem(r)}"
+
+
+def ler_csv_texto(texto: str) -> pd.DataFrame:
+    df = pd.read_csv(io.StringIO(texto), sep=None, engine="python")
+    df.columns = [c.strip() for c in df.columns]
+    return df
+
+
+def para_csv(df: pd.DataFrame) -> str:
+    d = df[COLUNAS_FICHEIRO].copy()
+    for c in ["Data Compra", "Data Venda"]:
+        d[c] = pd.to_datetime(d[c]).dt.strftime("%d/%m/%Y").fillna("")
+    return d.to_csv(index=False)
+
+
+def registar_venda(df: pd.DataFrame, ticker: str, qtd: float, preco: float, data):
+    """Vende por ordem de compra (FIFO). Divide o lote se a venda for parcial. Devolve (df, erro)."""
+    d = df.copy()
+    data = pd.Timestamp(data)
+    if qtd <= 0 or preco <= 0:
+        return None, "A quantidade e o preço têm de ser maiores que zero."
+    abertas = d[(d["Ticker"] == ticker) & d["Data Venda"].isna() & (d["Data Compra"] <= data)]
+    abertas = abertas.sort_values("Data Compra")
+    disponivel = abertas["Quantidade"].sum()
+    if qtd > disponivel + 1e-9:
+        return None, f"Só tinhas {disponivel:g} unidades de {ticker} compradas até essa data."
+    restante, novas = qtd, []
+    for idx, lote in abertas.iterrows():
+        if restante <= 1e-9:
+            break
+        if lote["Quantidade"] <= restante + 1e-9:  # vende o lote todo
+            d.loc[idx, "Data Venda"] = data
+            d.loc[idx, "Preço Venda"] = preco
+            restante -= lote["Quantidade"]
+        else:  # vende só uma parte: separa a parte vendida
+            fechado = lote.copy()
+            fechado["Quantidade"], fechado["Data Venda"], fechado["Preço Venda"] = restante, data, preco
+            novas.append(fechado)
+            d.loc[idx, "Quantidade"] = lote["Quantidade"] - restante
+            restante = 0
+    if novas:
+        d = pd.concat([d, pd.DataFrame(novas)], ignore_index=True)
+    return d, None
+
+
+def _guardar_e_atualizar(cfg, df, sha, mensagem, toast) -> bool:
+    erro = guardar_remoto(cfg, para_csv(df), sha, mensagem)
+    if erro:
+        st.error(erro)
+        return False
+    _ler_remoto.clear()
+    st.session_state["msg_toast"] = toast
+    st.rerun()
+    return True
+
+
+def painel_gerir(dados: pd.DataFrame, cfg, sha):
+    """Registar compras e vendas e editar a carteira guardada."""
+    if cfg is None:
+        st.info(
+            "Para registares compras e vendas aqui e a carteira ficar guardada, é preciso ligar a app a um repositório "
+            "privado do GitHub (GITHUB_TOKEN e GITHUB_REPO nos Secrets). Enquanto isso, a app usa o CSV que carregares."
+        )
+        return
+    st.caption("As alterações ficam guardadas num repositório privado teu e aparecem em todos os dispositivos.")
+    t_compra, t_venda, t_tabela, t_importar = st.tabs(["➕ Compra", "➖ Venda", "✏️ Editar tabela", "📥 Importar CSV"])
+    abertas = dados[dados["Data Venda"].isna()]
+    existentes = dados.drop_duplicates("Ticker").set_index("Ticker")
+
+    with t_compra:
+        with st.form("form_compra", clear_on_submit=True):
+            c_ticker = st.text_input("Ticker (símbolo do Yahoo Finance)", placeholder="AAPL, EDP.LS, VWCE.DE, BTC-USD")
+            c_qtd = st.number_input("Quantidade", min_value=0.0, step=1.0, format="%.6f")
+            c_preco = st.number_input("Preço de compra (na moeda do ativo)", min_value=0.0, format="%.4f")
+            c_moeda = st.selectbox("Moeda do preço", MOEDAS)
+            c_data = st.date_input("Data da compra", value=date.today(), format="DD/MM/YYYY")
+            c_tipo = st.selectbox("Tipo de ativo", TIPOS_VALIDOS)
+            c_setor = st.text_input("Setor (se o ativo já existe, pode ficar vazio)")
+            c_pais = st.text_input("País (se o ativo já existe, pode ficar vazio)")
+            enviar_compra = st.form_submit_button("Guardar compra")
+        if enviar_compra:
+            ticker = c_ticker.strip().upper()
+            setor, pais = c_setor.strip(), c_pais.strip()
+            if ticker in existentes.index:
+                setor = setor or existentes.loc[ticker, "Setor"]
+                pais = pais or existentes.loc[ticker, "País"]
+            if not ticker or c_qtd <= 0 or c_preco <= 0:
+                st.error("Preenche o ticker, a quantidade e o preço.")
+            elif not setor or not pais:
+                st.error("Preenche o setor e o país (é a primeira compra deste ativo).")
+            else:
+                nova = {
+                    "Ticker": ticker, "Quantidade": c_qtd, "Preço Médio de Compra": c_preco, "Tipo de Ativo": c_tipo,
+                    "Setor": setor, "País": pais, "Moeda": c_moeda, "Data Compra": pd.Timestamp(c_data),
+                    "Data Venda": pd.NaT, "Preço Venda": float("nan"),
+                }
+                novo = pd.concat([dados[COLUNAS_FICHEIRO], pd.DataFrame([nova])], ignore_index=True)
+                _guardar_e_atualizar(cfg, novo, sha, f"Compra: {c_qtd:g} {ticker}", f"Compra de {ticker} guardada ✅")
+
+    with t_venda:
+        if abertas.empty:
+            st.info("Não tens posições abertas para vender.")
+        else:
+            qtds = abertas.groupby("Ticker")["Quantidade"].sum()
+            st.caption("Em carteira: " + ", ".join(f"{t} ({q:g})" for t, q in qtds.items()))
+            with st.form("form_venda", clear_on_submit=True):
+                v_ticker = st.selectbox("Ativo", list(qtds.index))
+                v_qtd = st.number_input("Quantidade vendida", min_value=0.0, step=1.0, format="%.6f")
+                v_preco = st.number_input("Preço de venda (na moeda do ativo)", min_value=0.0, format="%.4f")
+                v_data = st.date_input("Data da venda", value=date.today(), format="DD/MM/YYYY")
+                enviar_venda = st.form_submit_button("Guardar venda")
+            if enviar_venda:
+                novo, erro = registar_venda(dados[COLUNAS_FICHEIRO], v_ticker, v_qtd, v_preco, v_data)
+                if erro:
+                    st.error(erro)
+                else:
+                    _guardar_e_atualizar(cfg, novo, sha, f"Venda: {v_qtd:g} {v_ticker}", f"Venda de {v_ticker} guardada ✅")
+            st.caption("As vendas são feitas pela ordem de compra (a mais antiga primeiro).")
+
+    with t_tabela:
+        st.caption("Corrige valores, adiciona linhas ou apaga (seleciona a linha e carrega em Delete). Depois guarda.")
+        editado = st.data_editor(
+            dados[COLUNAS_FICHEIRO].reset_index(drop=True),
+            num_rows="dynamic", hide_index=True, width="stretch", key="editor_carteira",
+            column_config={
+                "Tipo de Ativo": st.column_config.SelectboxColumn(options=TIPOS_VALIDOS),
+                "Moeda": st.column_config.SelectboxColumn(options=MOEDAS),
+                "Data Compra": st.column_config.DateColumn(format="DD/MM/YYYY"),
+                "Data Venda": st.column_config.DateColumn(format="DD/MM/YYYY"),
+            },
+        )
+        if st.button("💾 Guardar alterações da tabela"):
+            limpo = editado.dropna(subset=["Ticker"]).copy()
+            limpo["Ticker"] = limpo["Ticker"].astype(str).str.strip().str.upper()
+            limpo = limpo[(limpo["Ticker"] != "") & (limpo["Quantidade"] > 0) & (limpo["Preço Médio de Compra"] > 0)]
+            obrigatorias = ["Tipo de Ativo", "Setor", "País", "Moeda"]
+            vazias = limpo[obrigatorias].isna() | (limpo[obrigatorias].astype(str).apply(lambda s: s.str.strip()) == "")
+            if limpo.empty:
+                st.error("A tabela ficou sem linhas válidas.")
+            elif vazias.any().any():
+                st.error("Há linhas sem tipo de ativo, setor, país ou moeda.")
+            else:
+                _guardar_e_atualizar(cfg, limpo, sha, "Tabela editada na app", "Tabela guardada ✅")
+
+    with t_importar:
+        st.warning("Importar um CSV substitui toda a carteira guardada.")
+        novo_csv = st.file_uploader("CSV da carteira", type=["csv"], key="importar_csv")
+        if novo_csv is not None and st.button("Substituir carteira guardada"):
+            importado = validar(carregar_csv(novo_csv))
+            _guardar_e_atualizar(cfg, importado, sha, "Carteira importada de CSV", "Carteira importada ✅")
+
+
+# ---------------------------- Interface ----------------------------
 st.title("📈 Análise do meu Portefólio")
+verificar_acesso()
+if "msg_toast" in st.session_state:
+    st.toast(st.session_state.pop("msg_toast"))
+
+cfg = config_github()  # None se a carteira não estiver ligada ao GitHub
+
+# Atualizar e carregar ficheiro ficam na página principal: no telemóvel não é preciso abrir o menu
+if st.button("🔄 Atualizar dados"):
+    obter_precos.clear()
+    obter_taxas.clear()
+    obter_noticias.clear()
+    obter_historico_eur.clear()
+    obter_dividendos.clear()
+    _ler_remoto.clear()
+
+bruto, sha, remoto_existe = None, None, False
+if cfg:
+    texto_remoto, sha, erro_remoto = _ler_remoto(cfg["repo"], cfg["ficheiro"], cfg["ramo"], cfg["token"])
+    if erro_remoto:
+        st.error(erro_remoto)
+        st.stop()
+    if texto_remoto is not None:
+        bruto, remoto_existe = ler_csv_texto(texto_remoto), True
+if bruto is None:
+    if cfg:
+        st.info("Ainda não tens uma carteira guardada. Carrega o teu CSV e guarda-o na nuvem.")
+    ficheiro = st.file_uploader("📂 Carrega o teu portefólio (CSV)", type=["csv"])
+    if ficheiro is not None:
+        bruto = carregar_csv(ficheiro)
 
 with st.sidebar:
-    st.header("Dados")
-    ficheiro = st.file_uploader("Carrega o teu portefólio (CSV)", type=["csv"])
+    st.header("Opções")
     tipo_grafico = st.radio("Tipo de gráfico", ["Pie Chart", "Treemap"], horizontal=True)
     base_alocacao = st.radio("Alocação com base em", ["Valor Atual", "Valor Investido"], horizontal=True)
     nome_bench = st.selectbox("Benchmark", list(BENCHMARKS))
-    if st.button("🔄 Atualizar dados"):
-        obter_precos.clear()
-        obter_taxas.clear()
-        obter_noticias.clear()
-        obter_historico_eur.clear()
-        obter_dividendos.clear()
     st.caption("Colunas necessárias: " + ", ".join(COLUNAS))
     st.caption("Opcional: Moeda (por defeito EUR), Data Compra, Data Venda e Preço Venda (para a evolução real da carteira).")
 
-if ficheiro is None:
-    st.info("👈 Carrega um ficheiro CSV para começar. Abre o menu lateral (seta no canto superior esquerdo) se estiveres no telemóvel.")
+if bruto is None:
+    st.info("Carrega um ficheiro CSV acima para começar. As opções (gráficos e benchmark) estão no menu lateral, na seta no canto superior esquerdo.")
     st.stop()
 
-dados = validar(carregar_csv(ficheiro))
+dados = validar(bruto)
+if cfg and not remoto_existe and not dados.empty:
+    st.warning("Esta carteira ainda não está guardada na nuvem.")
+    if st.button("☁️ Guardar esta carteira na nuvem"):
+        _guardar_e_atualizar(cfg, dados, None, "Carteira inicial", "Carteira guardada na nuvem ✅")
 if dados.empty:
-    st.error("Não há dados válidos no ficheiro.")
+    st.warning("A carteira está vazia.")
+    painel_gerir(dados, cfg, sha)
     st.stop()
 
 # Posições atuais = linhas sem data de venda, juntas por ativo; todas as linhas (lotes) servem para o histórico
 abertas = dados[dados["Data Venda"].isna()]
 if abertas.empty:
-    st.error("Não há posições abertas no ficheiro (todas as linhas têm data de venda).")
+    st.warning("Não há posições abertas (todas as linhas têm data de venda).")
+    painel_gerir(dados, cfg, sha)
     st.stop()
 base = agregar_posicoes(abertas)
 lotes = dados[dados["Data Compra"].notna()]
@@ -538,8 +823,8 @@ if sem_cotacao:
     )
 
 # ---------------------------- Separadores ----------------------------
-tab_dash, tab_aloc, tab_risco, tab_div, tab_news = st.tabs(
-    ["Dashboard Geral", "Alocação por Setor/País", "Métricas de Risco", "Dividendos", "Notícias do Mercado"]
+tab_dash, tab_aloc, tab_risco, tab_div, tab_news, tab_gerir = st.tabs(
+    ["Dashboard Geral", "Alocação por Setor/País", "Métricas de Risco", "Dividendos", "Notícias do Mercado", "Gerir carteira"]
 )
 
 # ======== Dashboard Geral ========
@@ -829,3 +1114,7 @@ with tab_news:
                 titulo = n["titulo"].replace("[", "(").replace("]", ")")
                 data_txt = "" if pd.isna(n["data"]) else f" · {n['data']:%d/%m/%Y %H:%M}"
                 st.markdown(f"**[{titulo}]({n['url']})**  \n{n['fonte']}{data_txt}")
+
+# ======== Gerir carteira ========
+with tab_gerir:
+    painel_gerir(dados, cfg, sha)
